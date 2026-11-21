@@ -1,0 +1,74 @@
+#{
+    Przykład podstawowy: kompresja i dekompresja bloku przez publiczne API wrappera LZ4.
+
+    1. Kompresuje tekst z powtórzeniami (polskie litery w UTF-8 i bajt NUL w środku),
+       pokazuje rozmiary i odtwarza dane z dokładnym limitem.
+    2. Pokazuje trzy kontrolowane błędy: za mały limit (z podanym potrzebnym rozmiarem),
+       uszkodzony blok i ujemny limit (błędne wywołanie).
+    3. Kompresuje i odtwarza puste dane.
+    Kod zakończenia: liczba niezgodności (0 = wszystko jak oczekiwano).
+#}
+import core.containers.*;
+import lz4;
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    let wersja = lz4.wersjaBiblioteki();
+    print(f"Biblioteka LZ4 {wersja.asSlice()}\n");
+
+    # 1. Dane z powtórzeniami, z bajtem NUL w środku.
+    var dane: List[u8];
+    var powtorzenie: i64 = 0;
+    while (powtorzenie < 40) {
+        var fragment = lz4.bajtyTekstu("Zażółć gęślą jaźń - zapis stanu gry; ");
+        var i: i64 = 0;
+        while (i < fragment.length()) {
+            dane.push(fragment.at(i));
+            i += 1;
+        }
+        if (powtorzenie == 20) dane.push(0u8);
+        powtorzenie += 1;
+    }
+    let granica = lz4.granicaKompresji(dane.length());
+    var blok = lz4.kompresuj(&dane);
+    print(f"Dane: {dane.length()} B, granica wyniku (LZ4_compressBound): {granica} B, blok: {blok.dane.length()} B\n");
+    if (not blok.ok or blok.dane.length() >= dane.length()) bledy += 1;
+    var odtworzone = lz4.dekompresuj(&blok.dane, dane.length());
+    print(f"Dekompresja z limitem {dane.length()}: {lz4.nazwaRodzaju(odtworzone.rodzaj)}, {odtworzone.dane.length()} B, identyczne bajt po bajcie: {identyczne(&odtworzone.dane, &dane)}\n");
+    if (not odtworzone.ok or not identyczne(&odtworzone.dane, &dane)) bledy += 1;
+
+    # 2. Kontrolowane błędy.
+    var maly = lz4.dekompresuj(&blok.dane, 100);
+    print(f"Limit 100 B: {lz4.nazwaRodzaju(maly.rodzaj)} - {maly.blad.asSlice()} (potrzebny rozmiar: {maly.potrzebnyRozmiar})\n");
+    if (maly.rodzaj != lz4.ZA_MALY_LIMIT or maly.potrzebnyRozmiar != dane.length()) bledy += 1;
+    var zly: List[u8];
+    zly.push(16u8);    # token: 1 literał, potem dopasowanie
+    zly.push(65u8);    # 'A'
+    zly.push(5u8);     # przesunięcie 5 - wskazuje przed początek danych
+    zly.push(0u8);
+    var uszkodzony = lz4.dekompresuj(&zly, 1000);
+    print(f"Uszkodzony blok: {lz4.nazwaRodzaju(uszkodzony.rodzaj)} - {uszkodzony.blad.asSlice()}\n");
+    if (uszkodzony.rodzaj != lz4.USZKODZONE_DANE) bledy += 1;
+    var ujemny = lz4.dekompresuj(&blok.dane, -1);
+    print(f"Limit -1: {lz4.nazwaRodzaju(ujemny.rodzaj)} - {ujemny.blad.asSlice()}\n");
+    if (ujemny.rodzaj != lz4.BLEDNE_PARAMETRY) bledy += 1;
+
+    # 3. Puste dane.
+    var pusto: List[u8];
+    var pustyBlok = lz4.kompresuj(&pusto);
+    var pusteOdtworzone = lz4.dekompresuj(&pustyBlok.dane, 0);
+    print(f"Puste dane: blok {pustyBlok.dane.length()} B, odtworzone {pusteOdtworzone.dane.length()} B ({lz4.nazwaRodzaju(pusteOdtworzone.rodzaj)})\n");
+    if (not pustyBlok.ok or not pusteOdtworzone.ok or pusteOdtworzone.dane.length() != 0) bledy += 1;
+    print(f"Niezgodnosci: {bledy}\n");
+    return bledy;
+}

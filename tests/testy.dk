@@ -1,0 +1,197 @@
+# Testy wrappera LZ4: build.py podstawia ten plik w miejsce app/app.dk.
+# Pliki testowe powstają w bieżącym katalogu (domyślnie katalog budowy).
+# Każde sprawdzenie wypisuje PASS albo FAIL; kod zakończenia to liczba błędów.
+import core.containers.*;
+import lz4;
+
+fun sprawdz(warunek: bool, nazwa: str) -> i64 = {
+    if (warunek) {
+        print(f"PASS {nazwa}\n");
+        return 0;
+    }
+    print(f"FAIL {nazwa}\n");
+    return 1;
+}
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+# Pseudolosowe bajty (xorshift64*): dane prawie nie do skompresowania.
+fun losowe(ile: i64, ziarno: u64) -> List[u8] = {
+    var wynik: List[u8];
+    var s = ziarno;
+    var i: i64 = 0;
+    while (i < ile) {
+        s = s ^ (s >> 12u64);
+        s = s ^ (s << 25u64);
+        s = s ^ (s >> 27u64);
+        let x = s * 2685821657736338717u64;
+        wynik.push((x >> 56u64) as u8);
+        i += 1;
+    }
+    return wynik;
+}
+
+fun powtarzalne(ile: i64) -> List[u8] = {
+    var wynik: List[u8];
+    var i: i64 = 0;
+    while (i < ile) {
+        wynik.push(((i % 7) + 97) as u8);
+        i += 1;
+    }
+    return wynik;
+}
+
+# Pełny obieg: kompresja i dekompresja z dokładnym limitem daje identyczne dane.
+fun obieg(dane: ref List[u8]) -> bool = {
+    var blok = lz4.kompresuj(dane);
+    if (not blok.ok) return false;
+    if (blok.dane.length() > lz4.granicaKompresji(dane.length())) return false;
+    var wynik = lz4.dekompresuj(&blok.dane, dane.length());
+    return wynik.ok and wynik.rodzaj == lz4.OK and identyczne(&wynik.dane, dane);
+}
+
+fun testyRozmiarow() -> i64 = {
+    var b: i64 = 0;
+    let wersja = lz4.wersjaBiblioteki();
+    print(f"  (biblioteka: LZ4 {wersja.asSlice()})\n");
+    b += sprawdz(wersja.length() >= 5, "wersja biblioteki dostepna");
+    b += sprawdz(lz4.miesciSieWInt(0) and lz4.miesciSieWInt(2147483647) and not lz4.miesciSieWInt(2147483648) and not lz4.miesciSieWInt(-1), "kontrola typu int z C: 0 i 2147483647 tak, 2147483648 i -1 nie");
+    b += sprawdz(lz4.granicaKompresji(0) == 16 and lz4.granicaKompresji(1000) == 1019 and lz4.granicaKompresji(255) == 272, "granica kompresji: n + n/255 + 16");
+    b += sprawdz(lz4.granicaKompresji(2113929216) > 2113929216 and lz4.granicaKompresji(2113929217) == -1 and lz4.granicaKompresji(-5) == -1, "granica: LZ4_MAX_INPUT_SIZE przyjete, wiecej i ujemne odrzucone");
+    return b;
+}
+
+fun testyObiegu() -> i64 = {
+    var b: i64 = 0;
+    var pusto: List[u8];
+    var pustyBlok = lz4.kompresuj(&pusto);
+    b += sprawdz(pustyBlok.ok and pustyBlok.dane.length() == 1, "puste dane: blok jednobajtowy");
+    var pusteWynik = lz4.dekompresuj(&pustyBlok.dane, 0);
+    b += sprawdz(pusteWynik.ok and pusteWynik.dane.length() == 0, "puste dane: odtworzone z limitem 0");
+    var nul: List[u8];
+    nul.push(0u8);
+    b += sprawdz(obieg(&nul), "jeden bajt NUL: obieg bez zmian");
+    var zNul = lz4.bajtyTekstu("abc");
+    zNul.push(0u8);
+    zNul.push(0u8);
+    zNul.push(255u8);
+    zNul.push(0u8);
+    b += sprawdz(obieg(&zNul), "bajty NUL i 255 w srodku danych: obieg bez zmian");
+    var tekst = lz4.kompresujTekst("Zażółć gęślą jaźń. Zażółć gęślą jaźń. Zażółć gęślą jaźń.");
+    var tekstWynik = lz4.dekompresuj(&tekst.dane, 1000);
+    let odtworzony = lz4.tekstZBajtow(&tekstWynik.dane);
+    var wzor: String;
+    wzor.append("Zażółć gęślą jaźń. Zażółć gęślą jaźń. Zażółć gęślą jaźń.");
+    var a = lz4.bajtyTekstu(odtworzony.asSlice());
+    var c = lz4.bajtyTekstu(wzor.asSlice());
+    b += sprawdz(tekstWynik.ok and identyczne(&a, &c), "tekst UTF-8 (polskie litery): obieg bez zmian, limit wiekszy niz potrzeba");
+    var duzo = powtarzalne(1000000);
+    var duzyBlok = lz4.kompresuj(&duzo);
+    b += sprawdz(duzyBlok.ok and duzyBlok.dane.length() < 10000 and obieg(&duzo), "1 MB powtarzalnych danych: blok ponizej 10 KB, obieg bez zmian");
+    var los = losowe(100000, 12345u64);
+    var losBlok = lz4.kompresuj(&los);
+    b += sprawdz(losBlok.ok and losBlok.dane.length() > 100000 and losBlok.dane.length() <= lz4.granicaKompresji(100000) and obieg(&los), "100 KB losowych danych: blok wiekszy niz dane, ale w granicy; obieg bez zmian");
+    var zera = powtarzalne(0);
+    var k: i64 = 0;
+    while (k < 70000) { zera.push(0u8); k += 1; }
+    b += sprawdz(obieg(&zera), "70 000 bajtow NUL: obieg bez zmian");
+    return b;
+}
+
+fun testyLimitu() -> i64 = {
+    var b: i64 = 0;
+    var dane = powtarzalne(1000);
+    var blok = lz4.kompresuj(&dane);
+    var dokladnie = lz4.dekompresuj(&blok.dane, 1000);
+    b += sprawdz(dokladnie.ok and dokladnie.dane.length() == 1000, "limit rowny rozmiarowi: sukces");
+    var oJeden = lz4.dekompresuj(&blok.dane, 999);
+    b += sprawdz(not oJeden.ok and oJeden.rodzaj == lz4.ZA_MALY_LIMIT and oJeden.potrzebnyRozmiar == 1000 and oJeden.dane.length() == 0, "limit o 1 za maly: ZA_MALY_LIMIT, potrzebny rozmiar 1000, brak danych");
+    var zero = lz4.dekompresuj(&blok.dane, 0);
+    b += sprawdz(zero.rodzaj == lz4.ZA_MALY_LIMIT, "limit 0 dla niepustych danych: ZA_MALY_LIMIT");
+    var ujemny = lz4.dekompresuj(&blok.dane, -1);
+    var zaDuzy = lz4.dekompresuj(&blok.dane, 2147483648);
+    b += sprawdz(ujemny.rodzaj == lz4.BLEDNE_PARAMETRY and zaDuzy.rodzaj == lz4.BLEDNE_PARAMETRY, "limit ujemny i ponad typ int: BLEDNE_PARAMETRY (blad wywolania, nie danych)");
+    return b;
+}
+
+fun testyUszkodzen() -> i64 = {
+    var b: i64 = 0;
+    var pusty: List[u8];
+    var zPustego = lz4.dekompresuj(&pusty, 100);
+    b += sprawdz(zPustego.rodzaj == lz4.USZKODZONE_DANE, "pusty blok: USZKODZONE_DANE");
+    var zly: List[u8];
+    zly.push(16u8);
+    zly.push(65u8);
+    zly.push(5u8);
+    zly.push(0u8);
+    var odZlego = lz4.dekompresuj(&zly, 1000);
+    b += sprawdz(odZlego.rodzaj == lz4.USZKODZONE_DANE and odZlego.dane.length() == 0, "dopasowanie przed poczatkiem danych: USZKODZONE_DANE");
+    var dane = lz4.bajtyTekstu("Dane do uciecia: 0123456789 0123456789 ABCDEFGHIJ abcdefghij KONIEC");
+    var blok = lz4.kompresuj(&dane);
+    var uciety: List[u8];
+    var i: i64 = 0;
+    while (i < blok.dane.length() - 3) { uciety.push(blok.dane.at(i)); i += 1; }
+    var odUcietego = lz4.dekompresuj(&uciety, 1000);
+    b += sprawdz(odUcietego.rodzaj == lz4.USZKODZONE_DANE, "uciety blok: USZKODZONE_DANE");
+    var dlugiLiteral: List[u8];
+    dlugiLiteral.push(240u8);  # token: literał 15+
+    dlugiLiteral.push(255u8);  # dalsza długość literału, bez danych
+    var odDlugiego = lz4.dekompresuj(&dlugiLiteral, 100000);
+    b += sprawdz(odDlugiego.rodzaj == lz4.USZKODZONE_DANE, "literal dluzszy niz blok: USZKODZONE_DANE");
+    return b;
+}
+
+fun testyFormatu() -> i64 = {
+    var b: i64 = 0;
+    var dane = powtarzalne(5000);
+    dane.push(0u8);
+    var kontener = lz4.zakoduj(&dane);
+    b += sprawdz(kontener.ok and kontener.dane.length() > 17 and kontener.dane.at(0) == 68u8 and kontener.dane.at(4) == 1u8, "format DKZ4: znacznik i wersja");
+    b += sprawdz(lz4.czytajLE(&kontener.dane, 5, 4) == 5001 and lz4.czytajLE(&kontener.dane, 9, 4) == kontener.dane.length() - 17 and lz4.czytajLE(&kontener.dane, 13, 4) == lz4.sumaKontrolna(&dane), "naglowek: rozmiar, rozmiar bloku i suma FNV-1a");
+    var odkodowane = lz4.odkoduj(&kontener.dane);
+    b += sprawdz(odkodowane.ok and identyczne(&odkodowane.dane, &dane), "DKZ4: obieg bez zmian (rozmiar z naglowka)");
+    var t = lz4.bajtyTekstu("");
+    b += sprawdz(lz4.sumaKontrolna(&t) == 2166136261 and lz4.sumaKontrolna(&dane) != 0, "FNV-1a pustych danych = 2166136261");
+    var zmieniony = copy kontener.dane;
+    zmieniony.at(5) = 4u8;     # rozmiar w nagłówku: 5001 -> 4 + 19*256 = 4868
+    var odZmienionego = lz4.odkoduj(&zmieniony);
+    b += sprawdz(not odZmienionego.ok and odZmienionego.rodzaj == lz4.USZKODZONE_DANE, "falszywy rozmiar w naglowku wykryty");
+    var znacznik = copy kontener.dane;
+    znacznik.at(0) = 88u8;
+    var odZnacznika = lz4.odkoduj(&znacznik);
+    b += sprawdz(odZnacznika.rodzaj == lz4.BLAD_PLIKU, "zly znacznik: BLAD_PLIKU");
+    var obciety: List[u8];
+    var o: i64 = 0;
+    while (o < kontener.dane.length() - 1) { obciety.push(kontener.dane.at(o)); o += 1; }
+    var odObcietego = lz4.odkoduj(&obciety);
+    b += sprawdz(odObcietego.rodzaj == lz4.BLAD_PLIKU, "obciety plik (zly rozmiar bloku): BLAD_PLIKU");
+    var suma = copy kontener.dane;
+    suma.at(13) = suma.at(13) ^ 1u8;
+    var odSumy = lz4.odkoduj(&suma);
+    b += sprawdz(odSumy.rodzaj == lz4.USZKODZONE_DANE and not odSumy.ok, "zla suma kontrolna: USZKODZONE_DANE");
+    var zapis = lz4.spakujDoPliku("test.dkz4", &dane);
+    var odczyt = lz4.rozpakujZPliku("test.dkz4");
+    b += sprawdz(zapis.ok and odczyt.ok and identyczne(&odczyt.dane, &dane), "zapis do pliku i odczyt: identyczne dane");
+    var brak = lz4.rozpakujZPliku("nie-ma-takiego-pliku.dkz4");
+    b += sprawdz(brak.rodzaj == lz4.BLAD_PLIKU and brak.blad.length() > 10, "brakujacy plik: BLAD_PLIKU z opisem");
+    return b;
+}
+
+fun main() -> i64 = {
+    var bledy: i64 = 0;
+    bledy += testyRozmiarow();
+    bledy += testyObiegu();
+    bledy += testyLimitu();
+    bledy += testyUszkodzen();
+    bledy += testyFormatu();
+    print(f"Bledy: {bledy}\n");
+    return bledy;
+}

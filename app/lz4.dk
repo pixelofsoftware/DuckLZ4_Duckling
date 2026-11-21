@@ -1,0 +1,405 @@
+#{
+    lz4: wrapper biblioteki LZ4 dla Ducklinga - kompresja i dekompresja surowych bloków bajtów
+    oraz prosty format pliku z zapisanym rozmiarem i sumą kontrolną.
+
+    Użytkownik pracuje na List[u8] (albo str) i nie widzi wskaźników: wrapper sprawdza
+    rozmiary, przydziela bufory, wywołuje bibliotekę i zwraca KOPIĘ wyniku jako List[u8],
+    która należy do wywołującego. Bufory biblioteki są zwalniane przed powrotem z funkcji.
+
+    Surowy blok LZ4 nie zapisuje pierwotnego rozmiaru, dlatego dekompresja wymaga limitu
+    (największego dopuszczalnego rozmiaru wyniku). Rodzaje błędów (pole rodzaj):
+    * BLEDNE_PARAMETRY - złe wywołanie: rozmiar lub limit ujemny albo poza typem int z C,
+      dane większe niż LZ4_MAX_INPUT_SIZE (2 113 929 216 bajtów);
+    * ZA_MALY_LIMIT    - blok jest poprawny, ale wynik nie mieści się w limicie; pole
+      potrzebnyRozmiar podaje rzeczywisty rozmiar (wrapper sprawdza to drugą próbą);
+    * USZKODZONE_DANE  - blok nie daje się odtworzyć (błędny, ucięty albo pusty);
+    * BLAD_PLIKU       - odczyt lub zapis pliku, zły nagłówek, niezgodna suma kontrolna;
+    * BRAK_PAMIECI     - nie udało się przydzielić bufora.
+    Biblioteka LZ4 nie odróżnia sama za małego bufora od uszkodzonych danych (w obu
+    przypadkach zwraca liczbę ujemną); rozróżnienie robi wrapper. Surowy blok nie ma sumy
+    kontrolnej, więc niektóre uszkodzenia mogą dać inne dane bez błędu - format pliku DKZ4
+    dodaje sumę kontrolną FNV-1a, która to wykrywa.
+#}
+import core.containers.*;
+import core.builtins as builtins;
+import core.clib as clib;
+
+extern("C") {
+    fundecl LZ4_compressBound(rozmiar: i32) -> i32;
+    fundecl LZ4_compress_default(zrodlo: cptr u8, cel: cptr u8, rozmiar: i32, pojemnosc: i32) -> i32;
+    fundecl LZ4_decompress_safe(zrodlo: cptr u8, cel: cptr u8, rozmiarBloku: i32, pojemnosc: i32) -> i32;
+    fundecl LZ4_versionString() -> cptr char;
+    fundecl strlen(s: cptr char) -> u64;
+    fundecl fopen(sciezka: cptr char, tryb: cptr char) -> cptr u8;
+    fundecl fread(dane: cptr u8, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl fwrite(dane: cptr u8, rozmiar: u64, ile: u64, plik: cptr u8) -> u64;
+    fundecl ferror(plik: cptr u8) -> i32;
+    fundecl fclose(plik: cptr u8) -> i32;
+}
+
+const OK: i32 = 0;
+const BLEDNE_PARAMETRY: i32 = 1;
+const ZA_MALY_LIMIT: i32 = 2;
+const USZKODZONE_DANE: i32 = 3;
+const BLAD_PLIKU: i32 = 4;
+const BRAK_PAMIECI: i32 = 5;
+
+const MAKS_INT: i64 = 2147483647;                 # INT_MAX z C (int 32-bitowy)
+const LZ4_MAX_INPUT_SIZE: i64 = 2113929216;       # 0x7E000000, z lz4.h
+const MAKS_DRUGIEJ_PROBY: i64 = 268435456;        # 256 MiB: górna granica bufora diagnozy limitu
+const NAGLOWEK_PLIKU: i64 = 17;                   # "DKZ4", wersja, rozmiar, rozmiar bloku, suma
+const MAKS_PLIK: i64 = 2147483647;
+
+class Wynik {
+    ok: bool = false;
+    rodzaj: i32 = OK;
+    dane: List[u8];               # kopia wyniku należąca do wywołującego
+    blad: String;
+    potrzebnyRozmiar: i64 = -1;   # przy ZA_MALY_LIMIT: rzeczywisty rozmiar wyniku
+}
+
+fun nazwaRodzaju(rodzaj: i32) -> str = {
+    if (rodzaj == OK) return "OK";
+    if (rodzaj == BLEDNE_PARAMETRY) return "BLEDNE_PARAMETRY";
+    if (rodzaj == ZA_MALY_LIMIT) return "ZA_MALY_LIMIT";
+    if (rodzaj == USZKODZONE_DANE) return "USZKODZONE_DANE";
+    if (rodzaj == BLAD_PLIKU) return "BLAD_PLIKU";
+    return "BRAK_PAMIECI";
+}
+
+fun blad(rodzaj: i32, opis: str) -> Wynik = {
+    var w: Wynik;
+    w.rodzaj = rodzaj;
+    w.blad.append(opis);
+    return w;
+}
+
+fun zC(tekst: cptr char) -> String = {
+    var wynik: String;
+    if (tekst as u64 == 0u64) return wynik;
+    wynik.append(builtins.slice_from_ptr_len[char](tekst as manyptr char, strlen(tekst) as i64));
+    return wynik;
+}
+
+# Wersja biblioteki, np. "1.10.0".
+fun wersjaBiblioteki() -> String = zC(LZ4_versionString());
+
+# Czy liczba mieści się w nieujemnym zakresie typu int z C (0..2 147 483 647).
+fun miesciSieWInt(n: i64) -> bool = n >= 0 and n <= MAKS_INT;
+
+# Największy możliwy rozmiar skompresowanego bloku dla danych o tym rozmiarze; -1 gdy za duże.
+fun granicaKompresji(rozmiar: i64) -> i64 = {
+    if (rozmiar < 0 or rozmiar > LZ4_MAX_INPUT_SIZE) return -1;
+    let g = LZ4_compressBound(rozmiar as i32) as i64;
+    if (g <= 0) return -1;
+    return g;
+}
+
+# Bufor z biblioteki C o rozmiarze co najmniej 1 bajtu (malloc(0) może zwrócić NULL).
+fun przydziel(rozmiar: i64) -> cptr u8 = {
+    var n = rozmiar;
+    if (n < 1) n = 1;
+    return clib.malloc(n as u64);
+}
+
+fun doBufora(dane: ref List[u8], bufor: cptr u8) -> () = {
+    let b = bufor as manyptr u8;
+    var i: i64 = 0;
+    while (i < dane.length()) {
+        b[i] = dane.at(i);
+        i += 1;
+    }
+}
+
+fun zBufora(bufor: cptr u8, ile: i64) -> List[u8] = {
+    var wynik: List[u8];
+    wynik.reserve(ile);
+    let b = bufor as manyptr u8;
+    var i: i64 = 0;
+    while (i < ile) {
+        wynik.push(b[i]);
+        i += 1;
+    }
+    return wynik;
+}
+
+fun bajtyTekstu(s: str) -> List[u8] = {
+    var wynik: List[u8];
+    wynik.reserve(s.length());
+    var i: i64 = 0;
+    while (i < s.length()) {
+        wynik.push(s[i] as u8);
+        i += 1;
+    }
+    return wynik;
+}
+
+fun tekstZBajtow(dane: ref List[u8]) -> String = {
+    var wynik: String;
+    var i: i64 = 0;
+    while (i < dane.length()) {
+        let bajt: u8 = dane.at(i);
+        wynik.append(bajt as char);
+        i += 1;
+    }
+    return wynik;
+}
+
+#{
+    Kompresja bloku bajtów (także pustego). Najpierw obliczamy granicę rozmiaru wyniku
+    (LZ4_compressBound), przydzielamy tyle pamięci, kompresujemy i zwracamy dokładnie tyle
+    bajtów, ile zwróciła biblioteka.
+#}
+fun kompresuj(dane: ref List[u8]) -> Wynik = {
+    let rozmiar = dane.length();
+    if (rozmiar > LZ4_MAX_INPUT_SIZE) {
+        return blad(BLEDNE_PARAMETRY, f"dane maja {rozmiar} bajtow, LZ4 przyjmuje najwyzej {LZ4_MAX_INPUT_SIZE}".asSlice());
+    }
+    let granica = granicaKompresji(rozmiar);
+    if (granica < 0) return blad(BLEDNE_PARAMETRY, f"nie mozna obliczyc granicy kompresji dla {rozmiar} bajtow".asSlice());
+    let wejscie = przydziel(rozmiar);
+    let wyjscie = przydziel(granica);
+    if (wejscie as u64 == 0u64 or wyjscie as u64 == 0u64) {
+        if (wejscie as u64 != 0u64) clib.free(wejscie);
+        if (wyjscie as u64 != 0u64) clib.free(wyjscie);
+        return blad(BRAK_PAMIECI, "brak pamieci na bufory kompresji");
+    }
+    doBufora(dane, wejscie);
+    let n = LZ4_compress_default(wejscie, wyjscie, rozmiar as i32, granica as i32) as i64;
+    var w: Wynik;
+    if (n <= 0) {
+        w.rodzaj = BLEDNE_PARAMETRY;
+        w.blad.append("LZ4_compress_default zwrocilo blad (0)");
+    } else {
+        w.dane = zBufora(wyjscie, n);
+        w.ok = true;
+    }
+    clib.free(wejscie);
+    clib.free(wyjscie);
+    return w;
+}
+
+fun kompresujTekst(s: str) -> Wynik = {
+    var dane = bajtyTekstu(s);
+    return kompresuj(&dane);
+}
+
+# Jedno wywołanie LZ4_decompress_safe; zwraca liczbę bajtów albo liczbę ujemną.
+fun probaDekompresji(wejscie: cptr u8, rozmiarBloku: i64, pojemnosc: i64, wynik: ref List[u8]) -> i64 = {
+    let wyjscie = przydziel(pojemnosc);
+    if (wyjscie as u64 == 0u64) return -1000000;
+    let n = LZ4_decompress_safe(wejscie, wyjscie, rozmiarBloku as i32, pojemnosc as i32) as i64;
+    if (n >= 0) wynik = zBufora(wyjscie, n);
+    clib.free(wyjscie);
+    return n;
+}
+
+#{
+    Dekompresja surowego bloku: limit to największy dopuszczalny rozmiar wyniku (0..INT_MAX).
+    Gdy biblioteka zgłosi błąd, wrapper sprawdza drugą próbą z większym buforem, czy blok jest
+    poprawny (wtedy ZA_MALY_LIMIT i potrzebnyRozmiar), czy uszkodzony (USZKODZONE_DANE).
+#}
+fun dekompresuj(blok: ref List[u8], limit: i64) -> Wynik = {
+    if (not miesciSieWInt(limit)) return blad(BLEDNE_PARAMETRY, f"limit {limit} poza zakresem 0..{MAKS_INT} (typ int z C)".asSlice());
+    if (not miesciSieWInt(blok.length())) return blad(BLEDNE_PARAMETRY, f"blok ma {blok.length()} bajtow - poza typem int z C".asSlice());
+    if (blok.length() == 0) return blad(USZKODZONE_DANE, "pusty blok nie jest poprawnym blokiem LZ4 (pusty wynik to blok jednobajtowy)");
+    let wejscie = przydziel(blok.length());
+    if (wejscie as u64 == 0u64) return blad(BRAK_PAMIECI, "brak pamieci na bufor wejsciowy");
+    doBufora(blok, wejscie);
+    var w: Wynik;
+    let n = probaDekompresji(wejscie, blok.length(), limit, &w.dane);
+    if (n >= 0) {
+        w.ok = true;
+    } else if (n == -1000000) {
+        w.rodzaj = BRAK_PAMIECI;
+        w.blad.append(f"brak pamieci na bufor wyniku ({limit} bajtow)");
+    } else {
+        # Druga próba: blok LZ4 rozwija się najwyżej ok. 255 razy.
+        var proba = blok.length() * 255 + 64;
+        if (proba > MAKS_DRUGIEJ_PROBY) proba = MAKS_DRUGIEJ_PROBY;
+        var sprawdzenie: List[u8];
+        var m: i64 = -1;
+        if (proba > limit) m = probaDekompresji(wejscie, blok.length(), proba, &sprawdzenie);
+        if (m >= 0) {
+            w.rodzaj = ZA_MALY_LIMIT;
+            w.potrzebnyRozmiar = m;
+            w.blad.append(f"wynik ma {m} bajtow, a limit to {limit}");
+        } else {
+            w.rodzaj = USZKODZONE_DANE;
+            w.blad.append(f"blok LZ4 jest uszkodzony albo uciety (LZ4_decompress_safe zwrocilo {n})");
+        }
+    }
+    clib.free(wejscie);
+    return w;
+}
+
+# Suma kontrolna FNV-1a (32 bity) - do wykrywania uszkodzeń w formacie pliku.
+fun sumaKontrolna(dane: ref List[u8]) -> i64 = {
+    var h: u64 = 2166136261u64;
+    var i: i64 = 0;
+    while (i < dane.length()) {
+        let bajt: u8 = dane.at(i);
+        h = ((h ^ (bajt as u64)) * 16777619u64) & 4294967295u64;
+        i += 1;
+    }
+    return h as i64;
+}
+
+fun dopiszLE(b: ref List[u8], wartosc: i64, bajtow: i64) -> () = {
+    var i: i64 = 0;
+    while (i < bajtow) {
+        b.push(((wartosc >> (8 * i)) & 255) as u8);
+        i += 1;
+    }
+}
+
+fun czytajLE(b: ref List[u8], od: i64, bajtow: i64) -> i64 = {
+    var w: i64 = 0;
+    var i: i64 = bajtow - 1;
+    while (i >= 0) {
+        let bajt: u8 = b.at(od + i);
+        w = w * 256 + (bajt as i64);
+        i -= 1;
+    }
+    return w;
+}
+
+#{
+    Format DKZ4 (dla zapisu do pliku), wszystkie liczby little-endian:
+      bajty 0-3   "DKZ4"
+      bajt  4     wersja formatu = 1
+      bajty 5-8   pierwotny rozmiar danych (u32)
+      bajty 9-12  rozmiar bloku LZ4 (u32)
+      bajty 13-16 suma kontrolna FNV-1a pierwotnych danych (u32)
+      dalej       surowy blok LZ4
+#}
+fun zakoduj(dane: ref List[u8]) -> Wynik = {
+    var blok = kompresuj(dane);
+    if (not blok.ok) return blok;
+    var w: Wynik;
+    w.dane.reserve(NAGLOWEK_PLIKU + blok.dane.length());
+    w.dane.push(68u8);   # D
+    w.dane.push(75u8);   # K
+    w.dane.push(90u8);   # Z
+    w.dane.push(52u8);   # 4
+    w.dane.push(1u8);
+    dopiszLE(&w.dane, dane.length(), 4);
+    dopiszLE(&w.dane, blok.dane.length(), 4);
+    dopiszLE(&w.dane, sumaKontrolna(dane), 4);
+    var i: i64 = 0;
+    while (i < blok.dane.length()) {
+        w.dane.push(blok.dane.at(i));
+        i += 1;
+    }
+    w.ok = true;
+    return w;
+}
+
+fun odkoduj(kontener: ref List[u8]) -> Wynik = {
+    if (kontener.length() < NAGLOWEK_PLIKU) return blad(BLAD_PLIKU, "za krotki naglowek DKZ4");
+    if (kontener.at(0) != 68u8 or kontener.at(1) != 75u8 or kontener.at(2) != 90u8 or kontener.at(3) != 52u8) {
+        return blad(BLAD_PLIKU, "to nie jest plik DKZ4 (zly znacznik)");
+    }
+    if (kontener.at(4) != 1u8) return blad(BLAD_PLIKU, "nieobslugiwana wersja formatu DKZ4");
+    let rozmiar = czytajLE(kontener, 5, 4);
+    let rozmiarBloku = czytajLE(kontener, 9, 4);
+    let suma = czytajLE(kontener, 13, 4);
+    if (rozmiarBloku != kontener.length() - NAGLOWEK_PLIKU) {
+        return blad(BLAD_PLIKU, f"naglowek podaje blok {rozmiarBloku} bajtow, a w pliku jest {kontener.length() - NAGLOWEK_PLIKU}".asSlice());
+    }
+    if (rozmiar > LZ4_MAX_INPUT_SIZE) return blad(BLAD_PLIKU, "naglowek podaje niemozliwy rozmiar danych");
+    var blok: List[u8];
+    blok.reserve(rozmiarBloku);
+    var i: i64 = NAGLOWEK_PLIKU;
+    while (i < kontener.length()) {
+        blok.push(kontener.at(i));
+        i += 1;
+    }
+    var w = dekompresuj(&blok, rozmiar);
+    if (not w.ok) {
+        if (w.rodzaj == ZA_MALY_LIMIT) {
+            var zly = blad(USZKODZONE_DANE, f"dane sa dluzsze niz rozmiar z naglowka ({rozmiar} bajtow)".asSlice());
+            return zly;
+        }
+        return w;
+    }
+    if (w.dane.length() != rozmiar) {
+        return blad(USZKODZONE_DANE, f"odtworzono {w.dane.length()} bajtow, naglowek podaje {rozmiar}".asSlice());
+    }
+    if (sumaKontrolna(&w.dane) != suma) return blad(USZKODZONE_DANE, "suma kontrolna sie nie zgadza - dane sa uszkodzone");
+    return w;
+}
+
+fun naC(s: str) -> String = {
+    var w: String;
+    w.append(s);
+    w.append('\0');
+    return w;
+}
+
+# Zapis bajtów do pliku (zastępuje istniejący); sprawdza zapis i zamknięcie.
+fun zapiszBajty(sciezka: str, dane: ref List[u8]) -> Wynik = {
+    let nazwa = naC(sciezka);
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char]("wb\0") as cptr char);
+    if (plik as u64 == 0u64) return blad(BLAD_PLIKU, f"nie mozna utworzyc pliku {sciezka}".asSlice());
+    let bufor = przydziel(dane.length());
+    if (bufor as u64 == 0u64) {
+        fclose(plik);
+        return blad(BRAK_PAMIECI, "brak pamieci na bufor zapisu");
+    }
+    doBufora(dane, bufor);
+    let n = fwrite(bufor, 1u64, dane.length() as u64, plik) as i64;
+    clib.free(bufor);
+    let zamkniecie = fclose(plik);
+    if (n != dane.length() or zamkniecie != 0i32) return blad(BLAD_PLIKU, f"blad zapisu pliku {sciezka}".asSlice());
+    var w: Wynik;
+    w.ok = true;
+    return w;
+}
+
+# Odczyt całego pliku (najwyżej 2 GiB).
+fun czytajBajty(sciezka: str) -> Wynik = {
+    let nazwa = naC(sciezka);
+    let plik = fopen(builtins.ptr_from_slice[char](nazwa.asSlice()) as cptr char, builtins.ptr_from_slice[char]("rb\0") as cptr char);
+    if (plik as u64 == 0u64) return blad(BLAD_PLIKU, f"nie mozna otworzyc pliku {sciezka} (brak pliku albo dostepu)".asSlice());
+    var w: Wynik;
+    let bufor = przydziel(65536);
+    var dalej = bufor as u64 != 0u64;
+    var poprawny = dalej;
+    while (dalej) {
+        let n = fread(bufor, 1u64, 65536u64, plik) as i64;
+        let b = bufor as manyptr u8;
+        var i: i64 = 0;
+        while (i < n) {
+            w.dane.push(b[i]);
+            i += 1;
+        }
+        if (w.dane.length() > MAKS_PLIK) {
+            poprawny = false;
+            dalej = false;
+        }
+        if (n < 65536) {
+            dalej = false;
+            if (ferror(plik) != 0i32) poprawny = false;
+        }
+    }
+    if (bufor as u64 != 0u64) clib.free(bufor);
+    fclose(plik);
+    if (not poprawny) return blad(BLAD_PLIKU, f"blad odczytu pliku {sciezka}".asSlice());
+    w.ok = true;
+    return w;
+}
+
+fun spakujDoPliku(sciezka: str, dane: ref List[u8]) -> Wynik = {
+    var kontener = zakoduj(dane);
+    if (not kontener.ok) return kontener;
+    var zapis = zapiszBajty(sciezka, &kontener.dane);
+    if (not zapis.ok) return zapis;
+    return kontener;
+}
+
+fun rozpakujZPliku(sciezka: str) -> Wynik = {
+    var plik = czytajBajty(sciezka);
+    if (not plik.ok) return plik;
+    return odkoduj(&plik.dane);
+}

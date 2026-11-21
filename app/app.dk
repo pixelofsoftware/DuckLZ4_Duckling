@@ -1,0 +1,122 @@
+#{
+    Praktyczne zastosowanie wrappera: pakowacz plików (np. zapisów stanu gry, cache, zasobów)
+    w formacie DKZ4 = nagłówek z rozmiarem i sumą kontrolną + surowy blok LZ4.
+
+    Program czyta ze standardowego wejścia trzy wiersze:
+      1. polecenie: spakuj albo rozpakuj,
+      2. plik wejściowy,
+      3. plik wyjściowy.
+    Po spakowaniu program od razu odczytuje plik wynikowy, rozpakowuje go i porównuje bajt po
+    bajcie z oryginałem. Kod zakończenia: 0 - sukces, 2 - złe parametry, 3 - błąd pliku
+    wejściowego, 4 - błąd zapisu, 5 - uszkodzone dane albo niezgodność przy sprawdzeniu.
+#}
+import core.containers.*;
+import core.primitive_io as io;
+import lz4;
+
+class Wiersz {
+    tekst: String;
+    jest: bool = false;
+}
+
+fun czytajWiersz() -> Wiersz = {
+    var w: Wiersz;
+    var znak = io.readCharCode();
+    if (znak < 0) return w;
+    w.jest = true;
+    while (znak >= 0 and znak != '\n' as i32) {
+        if (znak != '\r' as i32) w.tekst.append(znak as char);
+        znak = io.readCharCode();
+    }
+    return w;
+}
+
+fun rowne(a: str, b: str) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a[i] != b[i]) return false;
+        i += 1;
+    }
+    return true;
+}
+
+fun identyczne(a: ref List[u8], b: ref List[u8]) -> bool = {
+    if (a.length() != b.length()) return false;
+    var i: i64 = 0;
+    while (i < a.length()) {
+        if (a.at(i) != b.at(i)) return false;
+        i += 1;
+    }
+    return true;
+}
+
+# Stosunek rozmiarów w procentach z jednym miejscem po przecinku.
+fun procent(czesc: i64, calosc: i64) -> String = {
+    var w: String;
+    if (calosc <= 0) {
+        w.append("-");
+        return w;
+    }
+    let dziesiate = (czesc * 2000 + calosc) / (2 * calosc);
+    w.append((dziesiate / 10).toString());
+    w.append('.');
+    w.append((dziesiate % 10).toString());
+    w.append('%');
+    return w;
+}
+
+fun main() -> i64 = {
+    let wersja = lz4.wersjaBiblioteki();
+    print(f"Pakowacz DKZ4 (wrapper LZ4 {wersja.asSlice()}). Podaj: spakuj|rozpakuj, plik wejsciowy, plik wyjsciowy.\n");
+    let polecenie = czytajWiersz();
+    let wejscie = czytajWiersz();
+    let wyjscie = czytajWiersz();
+    if (not polecenie.jest or not wejscie.jest or not wyjscie.jest or wejscie.tekst.length() == 0 or wyjscie.tekst.length() == 0) {
+        print("Blad: podaj polecenie, plik wejsciowy i plik wyjsciowy w osobnych wierszach.\n");
+        return 2;
+    }
+    let pakuj = rowne(polecenie.tekst.asSlice(), "spakuj");
+    if (not pakuj and not rowne(polecenie.tekst.asSlice(), "rozpakuj")) {
+        print(f"Blad: nieznane polecenie '{polecenie.tekst.asSlice()}' (spakuj albo rozpakuj).\n");
+        return 2;
+    }
+    if (rowne(wejscie.tekst.asSlice(), wyjscie.tekst.asSlice())) {
+        print("Blad: plik wyjsciowy musi byc inny niz wejsciowy.\n");
+        return 2;
+    }
+    var dane = lz4.czytajBajty(wejscie.tekst.asSlice());
+    if (not dane.ok) {
+        print(f"Blad: {dane.blad.asSlice()}\n");
+        return 3;
+    }
+    if (pakuj) {
+        var spakowane = lz4.spakujDoPliku(wyjscie.tekst.asSlice(), &dane.dane);
+        if (not spakowane.ok) {
+            print(f"Blad ({lz4.nazwaRodzaju(spakowane.rodzaj)}): {spakowane.blad.asSlice()}\n");
+            if (spakowane.rodzaj == lz4.BLAD_PLIKU) return 4;
+            return 2;
+        }
+        let stosunek = procent(spakowane.dane.length(), dane.dane.length());
+        print(f"Spakowano {wejscie.tekst.asSlice()}: {dane.dane.length()} B -> {spakowane.dane.length()} B ({stosunek.asSlice()} oryginalu, z naglowkiem 17 B)\n");
+        var sprawdzenie = lz4.rozpakujZPliku(wyjscie.tekst.asSlice());
+        if (not sprawdzenie.ok or not identyczne(&sprawdzenie.dane, &dane.dane)) {
+            print("Blad: sprawdzenie nie powiodlo sie - rozpakowane dane roznia sie od oryginalu.\n");
+            return 5;
+        }
+        print(f"Sprawdzenie: plik {wyjscie.tekst.asSlice()} rozpakowuje sie do identycznych {sprawdzenie.dane.length()} bajtow.\n");
+        return 0;
+    }
+    var rozpakowane = lz4.odkoduj(&dane.dane);
+    if (not rozpakowane.ok) {
+        print(f"Blad ({lz4.nazwaRodzaju(rozpakowane.rodzaj)}): {rozpakowane.blad.asSlice()}\n");
+        return 5;
+    }
+    let zapis = lz4.zapiszBajty(wyjscie.tekst.asSlice(), &rozpakowane.dane);
+    if (not zapis.ok) {
+        print(f"Blad: {zapis.blad.asSlice()}\n");
+        return 4;
+    }
+    print(f"Rozpakowano {wejscie.tekst.asSlice()}: {dane.dane.length()} B -> {rozpakowane.dane.length()} B, suma kontrolna zgodna.\n");
+    return 0;
+}
