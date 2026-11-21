@@ -1,5 +1,7 @@
 # DuckLZ4: wrapper LZ4 dla Ducklinga
 
+![Napisane w Duckling](https://img.shields.io/badge/napisane%20w-Duckling-f2c94c)
+
 Zespół: Pixel of Software (Marcin Kowalczyk). Temat: P02 DuckBridge, biblioteka LZ4 (poziom 1). Skład: 1 osoba.
 
 Moduł `lz4` (`app/lz4.dk`) udostępnia w Ducklingu kompresję danych aplikacji przez bibliotekę C LZ4: zasobów, lokalnego cache i zapisów stanu. API przyjmuje i zwraca `List[u8]` (albo `str`).
